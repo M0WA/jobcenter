@@ -32,7 +32,7 @@ use JobCenter::Pg;
 use JobCenter::Util qw(:daemon);
 
 # transaction backoff time
-our $backoff = 0.1;
+our $backoff = .3; # 0.1;
 
 # minimal timer value
 our $timer_min = 0.1;
@@ -46,15 +46,17 @@ sub _calljobtaskproc {
 	my ($db, $proc, $arg, $retries) = @_;
 	$retries ||= 1;
 	#$log->debug("select * from $proc($arg)");
+	$log->info("$proc($arg)");
 	$db->query("select * from $proc(\$1)", $arg, sub {
 		my ($db, $err, $res) = @_;
 		$log->debug("_calljobtaskproc callback");
 		my $sqlstate = $res->sth->state;
 		if ($sqlstate eq '40001' or $sqlstate eq '40P01') {
-			$log->debug("scheduling retry of _calljobtaskproc $proc($arg): $sqlstate");
 			$res->sth->finish;
+			my $timeout = $backoff + rand($retries * $backoff);
+			$log->debug("scheduling retry $retries after $timeout of _calljobtaskproc $proc($arg): $sqlstate");
 			# try a backoff with a bit of randomness
-			$ioloop->timer(($backoff + rand($retries * $backoff)) => sub {
+			$ioloop->timer($timeout => sub {
 				$log->debug("retry $retries of _calljobtaskproc $proc($arg)");
 				_calljobtaskproc($db, $proc, $arg, $retries + 1);
 			});
@@ -71,10 +73,10 @@ sub _calljobtaskproc {
 		return unless ref $r eq 'ARRAY' and defined @$r[1];
 		my ($error, $jobtask) = @$r;
 		if ($error) {
-			$log->debug("_calljobtaskproc: error condition, calling errortask $jobtask");
+			$log->info("$proc($arg): error condition, calling errortask $jobtask");
 			_calljobtaskproc($db, 'do_jobtaskerror', $jobtask);
 		} else {
-			$log->debug("do_next_cb: next: $jobtask");
+			$log->info("$proc($arg): next: $jobtask");
 			_calljobtaskproc($db, 'do_jobtask', $jobtask);
 		}
 		return;
@@ -184,10 +186,10 @@ sub main {
 		$log->debug("jcpg: $jcpg has new connection: $dbh");
 	});
 
-	for my $listen (qw[jobtask jobtaskdone jobtaskerror ping]) {
+	for my $listen (qw[jobtask jobtaskdone jobtaskerror ping wait_for_children]) {
 		$jcpg->pubsub->listen($listen => sub {
 			my ($pubsub, $payload) = @_;
-			$log->debug("got NOTIFY \"$listen\""
+			$log->info("got NOTIFY \"$listen\""
 				. ($payload ? ", '$payload';" : ''));
 			calljobtaskproc("do_$listen", $payload);
 		});
@@ -217,9 +219,10 @@ sub main {
 		$ioloop->stop
 	};
 
+	$log->info('maestro starting work');
 	$ioloop->start;
+	$log->info('maestro done?');
 
-	$log->info('the end is nigh!');
 	unlink $pid_file if -w $pid_file;
 
 	return 0;

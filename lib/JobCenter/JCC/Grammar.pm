@@ -84,16 +84,31 @@ jcl: .ignorable* ( +workflow | +action ) .ignorable*
 
 # hack in action support
 action: +action-type +workflow-name colon (
-	( .ignorable | +in | +out | +env | +role | +config )+
-	| `syntax error: action [name]\n:<action>` )
+	( .ignorable
+	| +interface
+	| +in
+	| +out
+	| +env
+	| +role
+	| +config )+ | `syntax error: action [name]\n:<action>` )
 
 action-type: / ( 'action' | 'procedure' ) / +
 
 workflow: / 'workflow' + / +workflow-name colon (
-	( .ignorable | +in | +out | +wfenv | +role | +config | +locks | +wfomap | +do )+
-	| `syntax error: workflow [name]\n:<workflow>` )
+	( .ignorable
+	| +interface
+	| +in
+	| +out
+	| +wfenv
+	| +role
+	| +config
+	| +locks
+	| +wfomap
+	| +do )+ | `syntax error: workflow [name]\n:<workflow>` )
 
 workflow-name: /( ALPHA [ WORDS DOT ]* )/ | string
+
+interface: / 'interface' / + +workflow-name colon
 
 in: / 'in' <colon> / ( block-indent inout block-undent
 	| `syntax error: in:\n<inout>` )
@@ -108,8 +123,6 @@ inout: ( +iospec | .ignorable )*
 
 iospec: block-ondent identifier + identifier (+ / ('optional') / | + literal)? / - SEMI? - /
 
-idlist: block-ondent identifier
-
 config: / 'config' <colon> / ( assignments | `syntax error: config:\n<assignments>` )
 
 wfenv: / 'wfenv' <colon> / ( assignments | `syntax error: wfenv:\n<assignments>` )
@@ -123,6 +136,8 @@ lockspec: block-ondent identifier  + ( identifier | / ( UNDER ) / ) (+ / ( 'inhe
 role: / 'role' <colon> / (
 	block-indent ( idlist | .ignorable )* block-undent
 	| `syntax error: role:\n<idlist>` )
+
+idlist: block-ondent identifier
 
 wfomap: / 'wfomap' <colon> / ( assignments | `syntax error: wfomap:\n<assignments>` )
 
@@ -143,9 +158,11 @@ statement:
 	| +eval
 	| +goto
 	| +if
+	| +interface-call
 	| +label
 	| +let
 	| +lock
+	| +map
 	| +raise_error
 	| +raise_event
 	| +repeat
@@ -187,8 +204,8 @@ magic-assignment: block-ondent / LANGLE / ( /( STAR )/ | identifier ( / COMMA / 
 
 lhs: ( / (ALPHA) DOT / )? varpart ( / DOT / varpart )*
 
-assignment-operator: / ( EQUAL | DOT EQUAL | PLUS EQUAL | DASH EQUAL | SLASH EQUAL | STAR EQUAL
-	| SLASH SLASH EQUAL | PIPE PIPE EQUAL ) /
+assignment-operator: / ( EQUAL | COMMA EQUAL | DOT EQUAL | PLUS EQUAL | DASH EQUAL | SLASH EQUAL
+	| STAR EQUAL | SLASH SLASH EQUAL | PIPE PIPE EQUAL ) /
 
 rhs: term ( +rhs-operator term | +regexmatch )*
 
@@ -242,6 +259,14 @@ elsif: / 'elsif' + / ( +condition colon +then elses? | `syntax error: elsif <con
 
 else: / 'else' <colon> / block
 
+interface-call: / 'interface' + / +call-name colon
+	( +interface-namelist block-ondent / 'call' - / +case-expression colon call-body
+	  | `syntax error: interface [name]:\n<names>` )
+
+interface-namelist: block-indent ( interface-name | .ignorable )+ block-undent
+
+interface-name: block-ondent workflow-name
+
 label: / 'label' + / identifier
 
 let: / 'let' <colon> / ( assignments | `syntax error: let:\n<assignments>` )
@@ -253,6 +278,13 @@ locktype: identifier
 
 lockvalue: ( perl_block | rhs )
 
+map: / 'map' + / +call-name / + 'using' + / ( +map-using | `syntax error: map [name] using [identifier]:` )
+	( map-body | `syntax error: map [name] using [identifier]:\n<map-body>` )
+
+map-using: variable colon
+
+map-body: +imap ( block-ondent / 'collect' / colon +omap )?
+
 raise_error: / 'raise_error' + / ( perl_block | rhs )
 
 raise_event: / 'raise_event' <colon> / assignments
@@ -263,9 +295,11 @@ return: / ('return') /
 
 sleep: / 'sleep' + / ( perl_block | rhs )
 
-split: / 'split' / colon block-indent +callflow+ block-undent
+split: / 'split' / colon block-indent ( split-body | `syntax error: split:\ns<split-body>` ) block-undent
 
-callflow: block-ondent / 'callflow' + / +call-name colon call-body
+split-body: ( block-ondent ( +map | +callflow | .ignorable ) )+
+
+callflow: / 'callflow' + / +call-name colon call-body
 
 subscribe: / 'subscribe' <colon> / assignments
 
@@ -289,7 +323,9 @@ condition: perl-block | rhs
 
 variable: / ( ALPHA ) DOT / varpart ( / DOT / varpart )*
 
-varpart: identifier ( / LSQUARE <integer> LSQUARE / )?
+varpart: +varpart-array | identifier
+
+varpart-array: identifier / LSQUARE <integer> RSQUARE /
 
 literal: +number | +boolean | +single-quoted-string | +double-quoted-string | +null
 
@@ -306,7 +342,9 @@ single-line-comment: / - HASH ANY* EOL /
 
 identifier: bare-identifier | string
 
-bare-identifier: /( ALPHA WORD* )/
+#bare-identifier: /( ALPHA WORD* )/
+# allow starting _
+bare-identifier: /( [a-zA-Z_] [0-9A-Za-z_ ]* )/
 
 string: single-quoted-string | double-quoted-string
 

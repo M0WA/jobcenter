@@ -8,6 +8,7 @@ AS $function$DECLARE
 	v_task_id INT;
 	v_wait boolean;
 	v_detach boolean;
+	v_map text;
 	v_args JSONB;
 	v_parent_env JSONB;
 	v_jcenv JSONB;
@@ -17,14 +18,19 @@ AS $function$DECLARE
 	v_inargs JSONB;
 	v_curdepth integer;
 	v_maxdepth integer;
+	v_array jsonb;
+	v_i bigint;
+	v_v jsonb;
+	v_children bigint[] := '{}';
 BEGIN
 	-- find the sub-worklow using the task in the parent
 	-- get the arguments and variables as well
 	SELECT
 		action_id, COALESCE( (attributes->>'wait')::boolean, true),
-		COALESCE( (attributes->>'detach')::boolean, false), arguments,
+		COALESCE( (attributes->>'detach')::boolean, false),
+		attributes->>'map', arguments,
 		COALESCE(environment, '{}'::jsonb), variables, current_depth
-		INTO v_workflow_id, v_wait, v_detach, v_args, v_parent_env, v_vars, v_curdepth
+		INTO v_workflow_id, v_wait, v_detach, v_map, v_args, v_parent_env, v_vars, v_curdepth
 	FROM 
 		actions
 		JOIN tasks USING (action_id)
@@ -47,12 +53,6 @@ BEGIN
 		RETURN do_raise_error(a_parentjobtask, format('maximum call depth would be exceeded: %s >= %s', v_curdepth, v_maxdepth), 'fatal');
 	END IF;
 
-	BEGIN
-		v_inargs := do_inargsmap(v_workflow_id, a_parentjobtask, v_args, v_parent_env, v_vars);
-	EXCEPTION WHEN OTHERS THEN
-		RETURN do_raise_error(a_parentjobtask, format('caught exception in do_inargsmap sqlstate %s sqlerrm %s', SQLSTATE, SQLERRM));
-	END;
-	
 	-- ok, now find the start task of the workflow
 	SELECT 
 		t.task_id INTO v_task_id
@@ -82,6 +82,56 @@ BEGIN
 	-- jcenv overwrites wfenv overwrites parent_env
 	v_env := jsonb_set(v_env, '{max_depth}', to_jsonb(v_maxdepth));
 
+	-- todo: unify this with the non-map case
+	IF v_map IS NOT NULL THEN
+		v_array := CASE WHEN v_map LIKE 'a.%' THEN v_args->substring(v_map,3) WHEN v_map LIKE 'v.%' THEN v_vars->substring(v_map,3) END;
+		--RAISE LOG 'hiero! %', v_array;
+		IF v_array IS NULL THEN
+			RETURN do_raise_error(a_parentjobtask, format('map variable %s does not exist?', v_map));
+		END IF;
+		IF jsonb_typeof(v_array) <> 'array' THEN
+			RETURN do_raise_error(a_parentjobtask, format('map variable %s is not an array', v_map));
+		END IF;
+		FOR v_i, v_v IN SELECT ordinality, value FROM jsonb_array_elements(v_array) WITH ORDINALITY LOOP
+			BEGIN
+				v_inargs := do_inargsmap(v_workflow_id, a_parentjobtask, v_args, v_parent_env || jsonb_build_object('_i', v_i::int, '_v', v_v), v_vars);
+			EXCEPTION WHEN OTHERS THEN
+				RETURN do_raise_error(a_parentjobtask, format('caught exception in do_inargsmap sqlstate %s sqlerrm %s', SQLSTATE, SQLERRM));
+			END;
+
+			-- now create the new job and mark the start task 'done'
+			INSERT INTO jobcenter.jobs
+				(workflow_id, task_id, state, arguments, environment,
+				 max_steps, current_depth, task_entered, task_started, task_completed,
+				 parentjob_id, job_state)
+			VALUES
+				(v_workflow_id, v_task_id, 'done', v_inargs, v_env,
+				 COALESCE((v_config->>'max_steps')::integer, 99), v_curdepth + 1, now(), now(), now(),
+				 a_parentjobtask.job_id,
+				 jsonb_build_object('parenttask_id', a_parentjobtask.task_id, 'parentwait', v_wait) )
+			RETURNING
+				job_id INTO v_job_id;
+
+			-- wake up the maestro for the new job
+			--RAISE NOTICE 'NOTIFY "jobtaskdone", %', (v_workflow_id::TEXT || ':' || v_task_id::TEXT || ':' || v_job_id::TEXT );
+			PERFORM pg_notify( 'jobtaskdone',  ( '(' || v_workflow_id || ',' || v_task_id || ',' || v_job_id || ')' ));
+
+			v_children = array_append(v_children, v_job_id);
+		END LOOP;
+		-- log the created child job_ids in the task_state
+		UPDATE jobs SET
+			task_state = jsonb_build_object('childjob_ids', to_jsonb(v_children))
+		WHERE job_id = a_parentjobtask.job_id;
+		-- and continue with the parentjob
+		RETURN do_task_epilogue(a_parentjobtask, false, null, v_array, null);
+	END IF;
+
+	BEGIN
+		v_inargs := do_inargsmap(v_workflow_id, a_parentjobtask, v_args, v_parent_env, v_vars);
+	EXCEPTION WHEN OTHERS THEN
+		RETURN do_raise_error(a_parentjobtask, format('caught exception in do_inargsmap sqlstate %s sqlerrm %s', SQLSTATE, SQLERRM));
+	END;
+	
 	--RAISE NOTICE 'do_create_childjob: v_wait is %', v_wait;
 
 	-- now create the new job and mark the start task 'done'
@@ -101,10 +151,11 @@ BEGIN
 
 	IF v_wait AND NOT v_detach THEN
 		-- mark the parent job as waiting for a child job
+		-- and log child job_id in task_state
 		UPDATE jobs SET
 			state = 'childwait',
 			task_started = now(),
-			out_args = jsonb_build_object('childjob_id', v_job_id) -- store child job_id somewhere
+			task_state = jsonb_build_object('childjob_id', v_job_id)
 		WHERE job_id = a_parentjobtask.job_id;
 		-- and continue with the childjob
 		RETURN do_task_epilogue((v_workflow_id, v_task_id, v_job_id)::jobtask, false, null, null, null);
@@ -112,9 +163,12 @@ BEGIN
 		-- wake up the maestro for the new job
 		--RAISE NOTICE 'NOTIFY "jobtaskdone", %', (v_workflow_id::TEXT || ':' || v_task_id::TEXT || ':' || v_job_id::TEXT );
 		PERFORM pg_notify( 'jobtaskdone',  ( '(' || v_workflow_id || ',' || v_task_id || ',' || v_job_id || ')' ));
+		-- log the child job_id in the task_state field
+		UPDATE jobs SET
+			task_state = jsonb_build_object('childjob_id', v_job_id)
+		WHERE job_id = a_parentjobtask.job_id;
 		-- and continue to next task
-		-- logging the child job_id in the out_args field
-		RETURN do_task_epilogue(a_parentjobtask, false, null, v_inargs, to_jsonb(v_job_id));
+		RETURN do_task_epilogue(a_parentjobtask, false, null, v_inargs, null);
 	END IF;
 	
 	-- not reached

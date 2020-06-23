@@ -7,8 +7,8 @@ use MojoX::NetstringStream;
 
 use Data::Dumper;
 
-has [qw(actions api con from id ns ping reqauth rpc stream tmr who
-	 workername worker_id)];
+has [qw(api con from id ns ping reqauth rpc stream slotgroups
+	tmr who workeractions workername worker_id)];
 
 sub new {
 	my $self = shift->SUPER::new();
@@ -32,10 +32,12 @@ sub new {
 		# Process input chunk
 		#print '    got chunk: ', Dumper(\$chunk);
 		my @err = $con->handle($chunk);
-		die join(' ', grep defined, @err) if @err;
+		$api->log->error(join(' ', grep defined, @err)) if @err;
 		$ns->close if $err[0];
 	});
-	$ns->on(close => sub { $self->_on_close(@_) });
+	$ns->on(close => sub {
+		$self->_on_close(@_);
+	});
 	$ns->on(nserr => sub {
 		my ($ns, $msg) = @_;
 		$api->log->error("$from ($self): $msg");
@@ -48,23 +50,26 @@ sub new {
 
 	$con->notify('greetings', {who =>'jcapi', version => '1.1'});
 	
-	$self->{actions} = {};
 	$self->{con} = $con;
 	$self->{from} = $from;
 	$self->{id} = $id;
 	$self->{ns} = $ns;
 	$self->{ping} = 60; # fixme: configurable?
 	$self->{rpc} = $rpc;
+	$self->{slotgroups} = {};
 	$self->{stream} = $stream;
+	$self->{workeractions} = {};
 	return $self;
 }
 
 sub _on_close {
 	my ($self, $ns) = @_;
-	Mojo::IOLoop->remove($self->{tmr}) if $self->{tmr};
+	Mojo::IOLoop->remove($self->tmr) if $self->tmr;
 	$self->emit(close => $self);
 	$self->con->close if $self->con;
 	%$self = ();
+	#$ns->close;
+	%$ns = ();
 }
 
 sub close {
@@ -72,9 +77,14 @@ sub close {
 	$self->stream->close_gracefully;
 }
 
+# clean up all (circular) references so that perl can do
+# the real destroying
+sub delete {
+	%{$_[0]} = ();
+}
+
 #sub DESTROY {
-#	my $self = shift;
-#	say 'destroying ', $self;
+#	say 'destroying ', $_[0];
 #}
 
 1;

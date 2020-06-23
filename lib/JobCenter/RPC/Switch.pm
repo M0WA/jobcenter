@@ -25,10 +25,10 @@ use File::Basename;
 
 # from cpan
 use Config::Tiny;
-use JSON::RPC2::TwoWay 0.03; # for access to the request
+use JSON::RPC2::TwoWay 0.04; # for access to the request
 # JSON::RPC2::TwoWay depends on JSON::MaybeXS anyways, so it can be used here
 # without adding another dependency
-use JSON::MaybeXS qw(decode_json encode_json);
+use JSON::MaybeXS;
 use MojoX::NetstringStream 0.05; # older versions have utf-8 bugs
 
 # jobcenter
@@ -37,18 +37,23 @@ use JobCenter::Util qw(:daemon hdiff);
 
 has [qw(
 	actions address auth cfg cfgpath channels clientid conn daemon debug
-	done jcpg jc_worker_id jobs lastping log method methods pending
-	ping_timeout port prefix rpc timeout tasks tls tmr token who
-	workername
+	done jcpg jc_worker_id jobs lastping listenstrings log method
+	methods ping_timeout port prefix rpc rpcs_worker_id timeout
+	tasks tls tmr token who workername
 )]; #
 
 # keep in sync with RPC::Switch::Client
 use constant {
 	RES_OK => 'RES_OK',
 	RES_WAIT => 'RES_WAIT',
+	RES_TIMEOUT => 'RES_TIMEOUT',
 	RES_ERROR => 'RES_ERROR',
 	RES_OTHER => 'RES_OTHER', # 'dunno'
+	WORK_OK                => 0,           # exit codes for work method
+	WORK_PING_TIMEOUT      => 92,
+	WORK_CONNECTION_CLOSED => 91,
 };
+
 
 sub new {
 	my ($class, %args) = @_;
@@ -68,13 +73,14 @@ sub new {
 	$ENV{'PGAPPNAME'} = $workername;
 	my $jcpg = JobCenter::Pg->new(
 		'postgresql://'
-		. $cfg->{jcswitch}->{user}
-		. ':' . $cfg->{jcswitch}->{pass}
-		. '@' . ( $cfg->{jcswitch}->{host} // '' )
-		. ( ($cfg->{jcswitch}->{port}) ? ':' . $cfg->{jcswitch}->{port} : '' )
+		. $cfg->{jcswitch}->{db_user}
+		. ':' . $cfg->{jcswitch}->{db_pass}
+		. '@' . ( $cfg->{jcswitch}->{db_host} // '' )
+		. ( ($cfg->{jcswitch}->{db_port}) ? ':' . $cfg->{jcswitch}->{db_port} : '' )
 		. '/' . $cfg->{jcswitch}->{db}
 	);
-	$jcpg->database_class('JobCenter::Pg::Db');
+	$jcpg->log($log);
+	#$jcpg->database_class('JobCenter::Pg::Db');
 	$jcpg->max_total_connections($cfg->{jcswitch}->{con} // 5); # sane default?
 	$jcpg->on(connection => sub { my ($e, $dbh) = @_; $log->debug("jcpg: new connection: $dbh"); });
 
@@ -165,22 +171,23 @@ sub new {
 		$ns->on(close => sub {
 			$conn->close;
 			$log->info('connection to rpcswitch closed');
+			$self->{_exit} = WORK_CONNECTION_CLOSED;
 			$self->{done}++;
 			Mojo::IOLoop->stop;
 		});
 	});
 
-	$self->{actions} = {}; # announced actions to listenstrings
+	$self->{actions} = {}; # announced actions by actionname
 	$self->{address} = $address;
 	$self->{channels} = {}; # per channel hash of jobs/waitids
 	$self->{clientid} = $clientid;
 	$self->{daemon} = $args{daemon} // 0;
 	$self->{debug} = $args{debug} // 1;
 	$self->{ping_timeout} = $args{ping_timeout} // 300;
+	$self->{listenstrings} = {}; # announced actions by listenstring
 	$self->{log} = $log;
 	$self->{method} = $method;
-	$self->{methods} = {}; # announced methods
-	$self->{pending} = {}; # jobs pending flag per actionname
+	$self->{methods} = {}; # announced methods by methodname
 	$self->{port} = $port;
 	$self->{prefix} = $prefix;
 	$self->{rpc} = $rpc;
@@ -218,6 +225,7 @@ sub new {
 	return;
 }
 
+
 sub _reconfigure {
 	my ($self, $reload) = @_;
 
@@ -234,7 +242,7 @@ sub _reconfigure {
 
 		#print 'methods to remove ', Dumper($rem);
 		for my $methodname (keys %$rem) {
-			$self->log->debug("withdrawing method $methodname from the rpcswitch");
+			$self->log->info("withdrawing method $methodname from the rpcswitch");
 			$self->withdraw_rpcs(method => $methodname);
 		}
 		
@@ -245,7 +253,7 @@ sub _reconfigure {
 
 		#print 'actions to remove ', Dumper($rem);
 		for my $actionname (keys %$rem) {
-			$self->log->debug("withdrawing action $actionname from the jobcenter");
+			$self->log->info("withdrawing action $actionname from the jobcenter");
 			$self->withdraw_jc(action => $actionname);
 		}
 
@@ -257,10 +265,10 @@ sub _reconfigure {
 		# initial configuration
 
 		my $err = $self->announce_rpcs(
-			method => "$self->{prefix}.get_status",
+			method => "$self->{prefix}._get_status",
 			handler => '_get_status',
 		);
-		die "could not announce get_status: $err" if $err;
+		die "could not announce $self->{prefix}._get_status: $err" if $err;
 
 		$methods = $self->cfg->{methods} or die 'no method configuration?';
 
@@ -268,17 +276,16 @@ sub _reconfigure {
 	}
 
 	for my $method (keys %$methods) {
-		$self->log->debug("announcing method $method to the rpcswitch");
+		$self->log->info("announcing method $method to the rpcswitch");
 		my $err = $self->announce_rpcs(
 			method => $method,
 			workflow => $methods->{$method},
-			handler => '_create_job',
 		);
 		die "could not announce_rpcs $method: $err" if $err;
 	}
 
 	for my $action (keys %$actions) {
-		$self->log->debug("announcing action $action to the jobcenter");
+		$self->log->info("announcing action $action to the jobcenter");
 		my $err = $self->announce_jc(
 			action => $action,
 			method => $actions->{$action}
@@ -287,37 +294,41 @@ sub _reconfigure {
 	}
 }
 
+
 # handle the greeting notification from the rpcswitch
 sub rpc_greetings {
 	my ($self, $c, $i) = @_;
-	Mojo::IOLoop->delay->steps(
-		sub {
-			my $d = shift;
-			die "wrong api version $i->{version} (expected 1.0)" unless $i->{version} eq '1.0';
-			$self->log->info('got greeting from ' . $i->{who});
-			$c->call('rpcswitch.hello', {who => $self->who, method => $self->method, token => $self->token}, $d->begin(0));
-		},
-		sub {
-			my ($d, $e, $r) = @_;
-			my $w;
-			#say 'hello returned: ', Dumper(\@_);
-			die "hello returned error $e->{message} ($e->{code})" if $e;
-			die 'no results from hello?' unless $r;
-			($r, $w) = @$r;
-			if ($r) {
-				$self->log->info("hello returned: $r, $w");
-				$self->{auth} = 1;
-			} else {
-				$self->log->error('hello failed: ' . ($w // ''));
-				$self->{auth} = 0; # defined but false
-			}
+	Mojo::IOLoop->delay(sub {
+		my $d = shift;
+		die "wrong api version $i->{version} (expected 1.0)" unless $i->{version} eq '1.0';
+		$self->log->info('got greeting from ' . $i->{who});
+		$c->call(
+			'rpcswitch.hello',
+			{who => $self->who, method => $self->method, token => $self->token},
+			$d->begin(0),
+		);
+	},
+	sub {
+		my ($d, $e, $r) = @_;
+		my $w;
+		#say 'hello returned: ', Dumper(\@_);
+		die "hello returned error $e->{message} ($e->{code})" if $e;
+		die 'no results from hello?' unless $r;
+		($r, $w) = @$r;
+		if ($r) {
+			$self->log->info("hello returned: $r, $w");
+			$self->{auth} = 1;
+		} else {
+			$self->log->error('hello failed: ' . ($w // ''));
+			$self->{auth} = 0; # defined but false
 		}
-	)->catch(sub {
+	})->catch(sub {
 		my ($err) = @_;
 		$self->log->error('something went wrong in handshake: ' . $err);
 		$self->{auth} = '';
 	});
 }
+
 
 # a result notification on a channel
 sub rpc_result {
@@ -332,6 +343,7 @@ sub rpc_result {
 	$rescb->($status, $outargs);
 	return;
 }
+
 
 # the rpcswitch telss us that somebody disconnected
 sub rpc_channel_gone {
@@ -356,6 +368,7 @@ sub rpc_channel_gone {
 	return;
 }
 
+
 # the rpcswitch pings us
 sub rpc_ping {
 	my ($self, $c, $i, $rpccb) = @_;
@@ -363,31 +376,6 @@ sub rpc_ping {
 	return 'pong!';
 }
 
-# ping the rpcswitch
-sub ping {
-	my ($self, $timeout) = @_;
-
-	$timeout //= $self->timeout;
-	my ($done, $ret);
-
-	Mojo::IOLoop->timer($timeout => sub {
-		$done++;
-	});
-
-	$self->conn->call('ping', {}, sub {
-		my ($e, $r) = @_;
-		if (not $e and $r and $r =~ /pong/) {
-			$ret = 1;
-		} else {
-			%$self = ();
-		}
-		$done++;
-	});
-
-	Mojo::IOLoop->singleton->reactor->one_tick while !$done;
-
-	return $ret;
-}
 
 sub work {
 	my ($self) = @_;
@@ -416,23 +404,24 @@ sub work {
 		Mojo::IOLoop->stop;
 	};
 
-	$self->log->debug(blessed($self) . ' starting work');
+	$self->log->info(blessed($self) . ' starting work');
+	$self->{_exit} = WORK_OK;
 	while (!$self->done) {
 		$self->_reconfigure($reload++);
 		Mojo::IOLoop->start;
 	}
 	$self->_shutdown(@_);
-	$self->log->debug(blessed($self) . ' done?');
+	$self->log->info(blessed($self) . ' done?');
 
-	return 0;
+	return $self->{_exit};
 }
+
 
 # announce a method at the rpcswitch
 sub announce_rpcs {
 	my ($self, %args) = @_;
 	my $method = $args{method} or croak 'no method?';
 	my $workflow = $args{workflow};
-	my $handler = $args{handler} or croak 'no handler?';
 
 	croak "already have method $method" if $self->methods->{$method};
 
@@ -440,8 +429,7 @@ sub announce_rpcs {
 	$doc = $self->_get_workflow_info($workflow) if $workflow;
 	
 	my $err;
-	Mojo::IOLoop->delay(
-	sub {
+	Mojo::IOLoop->delay(sub {
 		my $d = shift;
 		# fixme: check results?
 		$self->conn->call(
@@ -470,18 +458,10 @@ sub announce_rpcs {
 			$self->log->error("announce got res: $res msg: $msg");
 			return;
 		}
-                my $worker_id = $msg->{worker_id};
+                $self->{rpcs_worker_id} = $msg->{worker_id};
 		my $mi = { # method information
 			method => $method,
 			workflow => $workflow,
-			handler => $handler,
-			#upval => $args{upval},
-			#mode => $mode,
-			#undocb => $undocb,
-			#addenv => $args{addenv} // 0,
-			#method => $method,
-			#slots => $slots,
-			worker_id => $worker_id,
 		};
 		$self->methods->{$method} = $mi;
 		$self->rpc->register(
@@ -499,6 +479,7 @@ sub announce_rpcs {
 	return $err;
 }
 
+
 sub _get_workflow_info {
 	my ($self, $workflow) = @_;
 	die 'no workflow?' unless $workflow;
@@ -507,10 +488,11 @@ sub _get_workflow_info {
 		q[select * from get_workflow_info($1)],
 		$workflow,
 	)->array;
-	die "worflow $workflow not found" unless $res and $res->[0];
+	die "workflow $workflow not found" unless $res and $res->[0];
 	#print "info for $workflow:", Dumper($res);
 	return decode_json($res->[0]);
 }
+
 
 # handle the rpcswitch magic
 sub _wrap {
@@ -522,7 +504,7 @@ sub _wrap {
 	my $rpcswitch = $request->{rpcswitch} or
 		die "no rpcswitch information?";
 
-	$rpcswitch->{worker_id} = $mi->{worker_id};
+	$rpcswitch->{worker_id} = $self->{rpcs_worker_id};
 
 	my $resp = {
 		jsonrpc	    => '2.0',
@@ -546,16 +528,16 @@ sub _wrap {
 	};
 	my $handler = $mi->{handler};
 	eval {
-		$self->$handler($mi, $request, $cb1, $cb2);
+		$self->_create_job($mi, $request, $cb1, $cb2);
 	};
 	if ($@) {
 		$cb1->(RES_ERROR, $@);
 	}
 }
 
+
 # method call to jobcenter job
 sub _create_job {
-	#say '_magic: ', Dumper(\@_);
 	my ($self, $mi, $request, $cb1, $cb2) = @_;
 	my $method = $request->{method};
 	my $params = $request->{params};
@@ -569,9 +551,18 @@ sub _create_job {
 	my $wfname = $mi->{workflow} or die 'no workflowname?';
 	my $vtag = $mi->{vtag};
 
-	my $impersonate = $request->{rpcswitch}->{who};
-	my $vci = $request->{rpcswitch}->{vci};
-	my $env = '{"rpcswitch":true}';
+	my $rpcswitch = $request->{rpcswitch}; # should be there
+	my $impersonate = $rpcswitch->{who};
+	my $vci = $rpcswitch->{vci};
+	my $env;
+	if ($rpcswitch->{reqauth}) {
+		$env = decode_utf8(encode_json({
+			reqauth => $rpcswitch->{reqauth},
+			rpcswitch => JSON->true,
+		}));
+	} else {
+		$env = '{"rpcswitch":true}';
+	}
 
 	my $inargs = decode_utf8(encode_json($params));
 
@@ -580,105 +571,109 @@ sub _create_job {
 	# create_job throws an error when:
 	# - wfname does not exist
 	# - inargs not valid
-	Mojo::IOLoop->delay(
-		sub {
-			my ($d) = @_;
-			$self->jcpg->queue_query($d->begin(0));
-		},
-		sub {
-			my ($d, $db) = @_;
-			#($job_id, $listenstring) = @{
-			$db->dollar_only->query(
-				q[select * from create_job(wfname := $1, args := $2, tag := $3, impersonate := $4, env := $5)],
-				$wfname,
-				$inargs,
-				$vtag,
-				$impersonate,
-				$env,
-				$d->begin
-			);
-		},
-		sub {
-			my ($d, $err, $res) = @_;
+	Mojo::IOLoop->delay(sub {
+		my ($d) = @_;
+		$self->jcpg->queue_query($d->begin(0));
+	},
+	sub {
+		my ($d, $db) = @_;
+		#($job_id, $listenstring) = @{
+		$db->dollar_only->query(
+			q[select * from create_job(wfname := $1, args := $2, tag := $3, impersonate := $4, env := $5)],
+			$wfname,
+			$inargs,
+			$vtag,
+			$impersonate,
+			$env,
+			$d->begin
+		);
+	},
+	sub {
+		my ($d, $err, $res) = @_;
 
-			if ($err) {
-				$cb1->(RES_ERROR, $err);
-				return;
-			}
-			my ($job_id, $listenstring) = @{$res->array};
-			$res->finish; # free up db con..
-			unless ($job_id) {
-				$cb1->(RES_ERROR, "no result from call to create_job");
-				return;
-			}
-
-			# report back to our caller immediately
-			# this prevents the job_done notification overtaking the 
-			# 'job created' result...
-			$self->log->debug("created job_id $job_id listenstring $listenstring");
-			$cb1->(RES_WAIT, "$self->{prefix}:$job_id");
-
-			my $job = {
-				_what => 'job',
-				cb => $cb2,
-				job_id => $job_id,
-				lcb => \&_poll_done,
-				vci => $vci,
-			};
-
-			# to handle channel gone..
-			$self->{channels}->{$vci}->{$job_id} = $job;
-			# register for the central job finished listen
-			$self->{jobs}->{$job_id} = $job;
-
-			# do one poll first..
-			$self->_poll_done($job);
+		if ($err) {
+			$cb1->(RES_ERROR, $err);
+			return;
 		}
-	)->catch(sub {
+		my ($job_id, $listenstring) = @{$res->array};
+		$res->finish; # free up db con..
+		unless ($job_id) {
+			$cb1->(RES_ERROR, "no result from call to create_job");
+			return;
+		}
+
+		# report back to our caller immediately
+		# this prevents the job_done notification overtaking the
+		# 'job created' result...
+		$self->log->info("$vci ($impersonate): created job_id $job_id for $wfname with '$inargs'"
+			. (($vtag) ? " (vtag $vtag)" : ''));
+
+		$cb1->(RES_WAIT, "$self->{prefix}:$job_id");
+
+		my $job = {
+			_what => 'job',
+			cb => $cb2,
+			job_id => $job_id,
+			lcb => \&_poll_done,
+			vci => $vci,
+		};
+
+		# to handle channel gone..
+		$self->{channels}->{$vci}->{$job_id} = $job;
+		# register for the central job finished listen
+		$self->{jobs}->{$job_id} = $job;
+
+		# do one poll first..
+		$self->_poll_done($job);
+	})->catch(sub {
 		my ($err) = @_;
+		$self->log->error("_create_job caught $err");
 		$cb1->(RES_ERROR, $err);
 	});
 }
 
+
 sub _poll_done {
 	my ($self, $job) = @_;
-	Mojo::IOLoop->delay(
-		sub {
-			my ($d) = @_;
-			$self->jcpg->queue_query($d->begin(0));
-		},
-		sub {
-			my ($d, $db) = @_;
-			$db->dollar_only->query(
-				q[select * from get_job_status($1)],
-				$job->{job_id},
-				$d->begin
-			);
-		},
-		sub {
-			my ($d, $err, $res) = @_;
-			die $err if $err;
-			my ($outargs) = @{$res->array};
-			return unless $outargs; # job not finished
-			delete $self->{jobs}->{$job->{job_id}};
-			delete $self->{channels}->{$job->{vci}}->{$job->{job_id}} if $self->{channels}->{$job->{vci}};
-			$self->log->debug("calling cb $job->{cb} for job_id $job->{job_id} outargs $outargs");
-			my $outargsp;
-			local $@;
-			eval { $outargsp = decode_json(encode_utf8($outargs)); };
-			# should not happen?
-			$job->{cb}->(RES_ERROR, "$self->{prefix}:$job->{job_id}", 'error decoding json: ' . $outargs) if $@;
-			$job->{cb}->(RES_ERROR, "$self->{prefix}:$job->{job_id}", $outargsp->{error}) if $outargsp->{error};
-			$job->{cb}->(RES_OK, "$self->{prefix}:$job->{job_id}", $outargsp);
-			%$job = (); # delete
+	Mojo::IOLoop->delay(sub {
+		my ($d) = @_;
+		$self->jcpg->queue_query($d->begin(0));
+	},
+	sub {
+		my ($d, $db) = @_;
+		$db->dollar_only->query(
+			q[select * from get_job_status($1)],
+			$job->{job_id},
+			$d->begin
+		);
+	},
+	sub {
+		my ($d, $err, $res) = @_;
+		die $err if $err;
+		my ($job_id2, $outargs) = @{$res->array};
+		return unless $outargs; # job not finished
+		my $job_id=$job->{job_id};
+		delete $self->{jobs}->{$job_id};
+		delete $self->{channels}->{$job->{vci}}->{$job_id} if $self->{channels}->{$job->{vci}};
+		#$self->log->debug("calling cb $job->{cb} for job_id $job->{job_id} outargs $outargs");
+		$self->log->info("job $job_id done: outargs $outargs");
+		my $outargsp;
+		local $@;
+		eval { $outargsp = decode_json(encode_utf8($outargs)); };
+		# should not happen?
+		$outargsp = { error => "$@ error decoding json: " . $outargs } if $@;
+		if ($outargsp->{error}) {
+			$job->{cb}->(RES_ERROR, "$self->{prefix}:$job_id", $outargsp->{error});
+		} else {
+			$job->{cb}->(RES_OK, "$self->{prefix}:$job_id", $outargsp);
 		}
-	)->catch(sub {
+		%$job = (); # delete
+	})->catch(sub {
 		 $self->log->error("_poll_done caught $_[0]");
 	});
 }
 
 
-# fixme: reuse _poll_done?
 sub _get_status {
 	my ($self, $mi, $request, $cb1, $cb2) = @_;
 	#my $method = $request->{method}; # check?
@@ -706,50 +701,49 @@ sub _get_status {
 		$self->{jobs}->{$job_id} = $job;
 	}
 
-	Mojo::IOLoop->delay->steps(
-		sub {
-			my ($d) = @_;
-			$self->jcpg->queue_query($d->begin(0));
-		},
-		sub {
-			my ($d, $db) = @_;
-			$db->dollar_only->query(
-				q[select * from get_job_status($1)],
-				$job_id,
-				$d->begin
-			);
-		},
-		sub {
-			my ($d, $err, $res) = @_;
-			if ($err) {
-				$cb1->(RES_OTHER, $err);
-				goto cleanup; # ugly..
-			}
-			my ($outargs) = @{$res->array};
-			unless ($outargs) {
-				$cb1->(RES_WAIT, $wait_id);
-				return;
-			}
-			$self->log->debug("got status for job_id $job_id outargs $outargs");
-			$outargs = decode_json(encode_utf8($outargs));
-			if ($outargs->{error}) {
-				$cb1->(RES_ERROR, $outargs->{error});
-			} else {
-				$cb1->(RES_OK, $outargs);
-			}
-			cleanup:
-			if ($notify) {
-				# cleanup
-				my $job = delete $self->{jobs}->{$job_id};
-				delete $self->{channels}->{$vci}->{$job_id}
-					if $self->{channels}->{$vci};
-				%$job = ();
-			}
+	Mojo::IOLoop->delay(sub {
+		my ($d) = @_;
+		$self->jcpg->queue_query($d->begin(0));
+	},
+	sub {
+		my ($d, $db) = @_;
+		$db->dollar_only->query(
+			q[select * from get_job_status($1)],
+			$job_id,
+			$d->begin
+		);
+	},
+	sub {
+		my ($d, $err, $res) = @_;
+		if ($err) {
+			$cb1->(RES_OTHER, $err);
+			goto cleanup; # ugly..
 		}
-	)->catch(sub {
-		 $self->log->error("get_status caught $_[0]");
+		my ($outargs) = @{$res->array};
+		unless ($outargs) {
+			$cb1->(RES_WAIT, $wait_id);
+			return;
+		}
+		$self->log->debug("got status for job_id $job_id outargs $outargs");
+		$outargs = decode_json(encode_utf8($outargs));
+		if ($outargs->{error}) {
+			$cb1->(RES_ERROR, $outargs->{error});
+		} else {
+			$cb1->(RES_OK, $outargs);
+		}
+		cleanup:
+		if ($notify) {
+			# cleanup
+			my $job = delete $self->{jobs}->{$job_id};
+			delete $self->{channels}->{$vci}->{$job_id}
+				if $self->{channels}->{$vci};
+			%$job = ();
+		}
+	})->catch(sub {
+		 $self->log->error("_get_status caught $_[0]");
 	});
 }
+
 
 # withdraw a method at the rpcswitch
 sub withdraw_rpcs {
@@ -759,8 +753,7 @@ sub withdraw_rpcs {
 	croak "unnannounced method $method?" unless $self->methods->{$method};
 
 	my ($done, $err);
-	Mojo::IOLoop->delay(
-	sub {
+	Mojo::IOLoop->delay(sub {
 		my $d = shift;
 		$self->conn->call(
 			'rpcswitch.withdraw',
@@ -800,6 +793,7 @@ sub withdraw_rpcs {
 	return $err;
 }
 
+
 # announce a rpcswitch method as an action to the jobcenter
 sub announce_jc {
 	my ($self, %args) = @_;
@@ -824,96 +818,100 @@ sub announce_jc {
 		warn $@;
 		return $@;
 	}
+	my $action = {
+		actionname => $actionname,
+		listenstring => $listenstring,
+		methodname => $methodname,
+		pending => 0,
+	};
 	$self->log->debug("worker_id $worker_id listenstring $listenstring");
 	$self->jcpg->pubsub->listen($listenstring, sub {
 		my ($pubsub, $payload) = @_;
-		$self->_get_task($actionname, $methodname, $payload);
+		$self->_get_task($action, $payload);
 	});
-	$self->actions->{$actionname} = $listenstring;
+	$self->actions->{$actionname} = $action;
+	$self->listenstrings->{$listenstring} = $action;
 	$self->jc_worker_id($worker_id);
 	# set up a ping timer after the first succesfull announce
 	unless ($self->tmr) {
-		#$self->{tmr}  = Mojo::IOLoop->recurring( $self->ping, sub { $self->_ping($worker_id) } );
 		$self->{tmr}  = Mojo::IOLoop->recurring( 60, sub { $self->_ping($worker_id) } );
 	}
 	return;
 }
 
+
 sub _get_task {
-	my ($self, $actionname, $methodname, $payload) = @_;
-	
+	my ($self, $action, $payload) = @_;
+
 	die '_task_ready: no payload?' unless $payload; # whut?
-	
+
+	my $actionname = $action->{actionname};
+	my $methodname = $action->{methodname};
+
 	$self->log->debug("get_task: actioname $actionname, methodname $methodname, payload $payload");
 
 	$payload = decode_json($payload);
 	my $job_id = $payload->{job_id} // $payload->{poll} // die '_task_ready: invalid payload?';
 
-	#$self->{pending}->{$actionname} = 1 if $payload->{poll};
-	if ($payload->{poll}) {
-		$self->log->debug("set pending flag for $actionname");
-		$self->{pending}->{$actionname} = 1;
-	}
-
 	# in the stored-procedure low-level api a null value means poll
 	# (yeah it's a hack)
 	$job_id = undef if $job_id !~ /^\d+/;
 
-	Mojo::IOLoop->delay(
-		sub {
-			my ($d) = @_;
-			$self->jcpg->queue_query($d->begin(0));
-		},
-		sub {
-			my ($d, $db) = @_;
-			$db->dollar_only->query(
-				q[select * from get_task($1, $2, $3)],
-				$self->{workername},
-				$actionname,
-				$job_id,
-				$d->begin
-			);
-		},
-		sub {
-			my ($d, $err, $res1) = @_;
-			if ($err) {
-				$self->log->error("get_task threw $err");
-				return;
-			}
-			my $res2 = $res1->array;
-			$res1->finish;
-			my ($job_id, $cookie, $inargs, $env);
-			($job_id, $cookie, $inargs, $env) = @$res2 if $res2;
-			unless ($cookie) {
-				$self->log->debug("unset pending flag for $actionname");
-				$self->{pending}->{actionname} = 0;
-				return;
-			}
-			$self->log->debug("actionname $actionname cookie $cookie inargs $inargs");
-			$inargs = decode_json(encode_utf8($inargs));
-
-			my $task = {
-				actionname => $actionname,
-				methodname => $methodname,
-				inarggs => $inargs,
-				cookie => $cookie,
-				job_id => $job_id,
-			};
-			$self->tasks->{$cookie} = $task;
-			
-			$self->call_rpcs_nb(
-				method => $methodname,
-				inargs => $inargs,
-				# no wait cb
-				resultcb => sub {
-					$self->_task_done($task, @_);
-				},
-			);
+	Mojo::IOLoop->delay(sub {
+		my ($d) = @_;
+		$self->jcpg->queue_query($d->begin(0));
+	},
+	sub {
+		my ($d, $db) = @_;
+		$db->dollar_only->query(
+			q[select * from get_task($1, $2, $3)],
+			$self->{workername},
+			$actionname,
+			$job_id,
+			$d->begin
+		);
+	},
+	sub {
+		my ($d, $err, $res1) = @_;
+		if ($err) {
+			$self->log->error("get_task threw $err");
+			return;
 		}
-	)->catch(sub {
+		my $res2 = $res1->array;
+		$res1->finish;
+		my ($job_id, $cookie, $inargs, $env);
+		($job_id, $cookie, $inargs, $env) = @$res2 if $res2;
+		unless ($cookie) {
+			$action->{pending}-- if $action->{pending};
+			$self->log->debug("no cookie? unset pending flag for $actionname: "
+				. $action->{pending});
+			return;
+		}
+		$self->log->info("actionname $actionname job_id $job_id cookie $cookie"
+			. " inargs '$inargs'");
+		$inargs = decode_json(encode_utf8($inargs));
+
+		my $task = {
+			action => $action,
+			inarggs => $inargs,
+			cookie => $cookie,
+			job_id => $job_id,
+		};
+		$self->tasks->{$cookie} = $task;
+
+		$self->call_rpcs_nb(
+			method => $methodname,
+			inargs => $inargs,
+			# no wait cb
+			resultcb => sub {
+				$self->_task_done($task, @_);
+			},
+		);
+	})->catch(sub {
 		 $self->log->error("_get_task caught $_[0]");
 	}); # catch?
 }
+
 
 sub _task_done {
 	my ($self, $task, $status, $outargs) = @_;
@@ -921,8 +919,9 @@ sub _task_done {
 	delete $self->tasks->{$task->{cookie}};
 
 	if (!$status or $status ne RES_OK) {
-		# check for 'worker not available'
-		if ($outargs and $outargs =~ /\(-32003\)$/) {
+		# turn 'no worker available' and
+		# 'worker gone' into soft errors
+		if ($outargs and $outargs =~ /\(-3200(3|6)\)$/) {
 			# turn into a soft retryable error
 			$outargs = {
 				error => {
@@ -948,7 +947,8 @@ sub _task_done {
 	# should work as it came in via json rpc
 	$outargs = decode_utf8(encode_json($outargs));
 
-	$self->log->debug("done with action $task->{actionname} for job $task->{job_id}, outargs $outargs\n");
+	$self->log->info("done with action $task->{action}->{actionname}"
+		. " for job $task->{job_id}, outargs '$outargs'");
 
 	Mojo::IOLoop->delay(
 		sub {
@@ -971,7 +971,7 @@ sub _task_done {
 			$res->finish(); # because we don't need the results
 			#$self->log->debug("task_done_callback!");
 			#print 'pending: ', Dumper($self->{pending});
-			if ($self->{pending}->{$task->{actionname}}) {
+			if ($task->{action}->{pending}) {
 
 				# sigh.. we can't call get_task directly
 				# bacause we're in a Mojo::Pg callback chain here
@@ -979,27 +979,28 @@ sub _task_done {
 				Mojo::IOLoop->next_tick(sub {
 					#$self->log->debug("calling _get_task from next_tick callback!");
 					$self->_get_task(
-						$task->{actionname},
-						$task->{methodname},
+						$task->{action},
 						encode_json({
-							poll => "please_$task->{actionname}",
+							poll => "pending_$task->{action}->{actionname}",
 						})
 					);
 				});
-				$self->log->debug("calling _get_task from task_done callback!");
+				$self->log->debug("calling _get_task from task_done callback because of pending flag");
 			}
 		},
 	)->catch(sub {
-		 $self->log->error("get_status caught $_[0]");
+		 $self->log->error("_task_done caught $_[0]");
 	});
 }
+
 
 # withdraw an action from the jobcenter
 sub withdraw_jc {
 	my ($self, %args) = @_;
 	my $actionname = $args{action} or croak 'no action?';
-	my $listenstring = delete $self->actions->{$actionname};
-	croak "unannounced action $actionname?" unless $listenstring;
+	my $action = delete $self->actions->{$actionname};
+	croak "unannounced action $actionname?" unless $action;
+	delete $self->listenstrings->{$action->{listenstring}};
 
 	my ($res) = $self->jcpg->db->query(
 			q[select withdraw($1, $2)],
@@ -1008,33 +1009,86 @@ sub withdraw_jc {
 		)->array;
 	die "no result" unless $res and @$res;
 	
-	$self->jcpg->pubsub->unlisten($listenstring);
+	$self->jcpg->pubsub->unlisten($action->{listenstring});
 
 	return 1;
 }
+
 
 # ping the pg database
 sub _ping {
 	my $self = shift;
 	my $worker_id = shift;
 	$self->log->debug("ping($worker_id)!");
-	Mojo::IOLoop->delay(
-		sub {
-			my ($d) = @_;
-			$self->jcpg->queue_query($d->begin(0));
-		},
-		sub {
-			my ($d, $db) = @_;
-			$db->query(
-				q[select ping($1)],
-				$worker_id,
-				$d->begin
-			);
-		},
-	)->catch(sub {
-		 $self->log->error("get_status caught $_[0]");
+	Mojo::IOLoop->delay(sub {
+		my ($d) = @_;
+		$self->jcpg->queue_query($d->begin(0));
+	},
+	sub {
+		my ($d, $db) = @_;
+		$db->query(
+			q[select ping($1)],
+			$worker_id,
+			$d->begin
+		);
+	},
+	sub {
+		my ($d, $err, $res) = @_;
+		if ($err) {
+			$self->log->error("ping threw $err");
+			return;
+		}
+		$res->finish();
+		$res->db->dollar_only->query(
+			q[select * from poll_tasks($1)],
+			'{' . $worker_id . '}',
+			$d->begin
+		);
+	},
+	sub {
+		my ($d, $err, $res) = @_;
+		if ($err) {
+			$self->log->error("poll_tasks threw $err");
+			return;
+		}
+		my $rows = $res->sth->fetchall_arrayref();
+		$res->finish;
+		if (@$rows) {
+			$self->log->warn('_process_poll: ' . (scalar @$rows) . ' rows');
+			$self->_process_poll($rows);
+		}
+	})->catch(sub {
+		 $self->log->error("_ping caught $_[0]");
 	});
 }
+
+
+sub _process_poll {
+	my ($self, $rows) = @_;
+
+	for (@$rows) {
+		my ($ls, $worker_ids, $count) = @$_;
+		$self->log->debug("row: $ls, " . ($worker_ids // 'null') . " $count");
+		my $action =  $self->listenstrings->{$ls};
+		next unless $action; # die?
+
+		#next if $action->{pending}; # already pending;
+		$self->log->debug("set pending flag for $action->{actionname}");
+		$action->{pending} = $count;
+
+		Mojo::IOLoop->next_tick(sub {
+			#$self->log->debug("calling _get_task from next_tick callback!");
+			$self->_get_task(
+				$action,
+				encode_json({
+					poll => "pending_$action->{actionname}",
+				})
+			);
+		});
+		$self->log->debug("calling _get_task from _process_poll!");
+	}
+}
+
 
 # call a method on the rpc switch
 sub call_rpcs_nb {
@@ -1071,7 +1125,10 @@ sub call_rpcs_nb {
 	my $delay = Mojo::IOLoop->delay(
 		sub {
 			my $d = shift;
-			$self->conn->call($method, $inargs, $d->begin(0), 1);
+			$self->conn->callraw({
+				method => $method,
+				params => $inargs
+			}, $d->begin(0));
 		},
 		sub {
 			#print Dumper(@_);
@@ -1082,6 +1139,7 @@ sub call_rpcs_nb {
 				$rescb->(RES_ERROR, "$e->{message} ($e->{code})");
 				return;
 			}
+			# print Dumper(\@_) unless Scalar::Util::reftype($r) eq "HASH";
 			my ($status, $outargs) = @{$r->{result}};
 			if ($status eq RES_WAIT) {
 				#print '@$r', Dumper($r);
@@ -1104,34 +1162,35 @@ sub call_rpcs_nb {
 		}
 	)->catch(sub {
 		my ($err) = @_;
-		$self->log->error("Something went wrong in call_nb: $err");
+		$self->log->error("Something went wrong in call_rpcs_nb: $err");
 		$rescb->(RES_ERROR, $err);
 	});
 }
+
 
 sub _shutdown {
 	my($self) = @_;
 	$self->log->info("shutting down..");
 
-	Mojo::IOLoop->stop;
-
 	# explicit copy becuase we modify the hash below
 	my @actions = keys %{$self->actions};
-	for my $actionname (@actions) {
-		$self->log->debug("withdrawing action $actionname from the jobcenter");
-		$self->withdraw_jc(action => $actionname);
+	for my $action (@actions) {
+		$self->log->debug("withdrawing action $action from the jobcenter");
+		$self->withdraw_jc(action => $action);
 	}
 
-	for my $methodname (keys %{$self->methods}) {
-		$self->log->debug("withdrawing method $methodname from the rpcswitch");
-		$self->withdraw_rpcs(method => $methodname);
+	# only try to withdraw methods from the rpcswitch if we're still connected..
+	unless ($self->{_exit}) {
+		for my $method (keys %{$self->methods}) {
+			$self->log->debug("withdrawing method $method from the rpcswitch");
+			$self->withdraw_rpcs(method => $method);
+		}
+		$self->methods({});
 	}
-	$self->methods({});
 
-	$self->log->info('waiting for ' . (scalar keys %{$self->{tasks}}) . ' tasks to finish');
-	# wait for how long?
-	Mojo::IOLoop->singleton->reactor->one_tick while
-		scalar keys %{$self->{tasks}};
+	$self->log->info('sending soft errors for ' . (scalar keys %{$self->{tasks}}) . ' unfinished tasks');
+	$self->_task_done($_, { error => { class => 'soft', msg => 'jcswitch shutting down'}})
+		for (%{$self->{tasks}});
 
 }
 

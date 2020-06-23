@@ -73,12 +73,14 @@ sub got_to_flatten {
 *got_funcname = \&got_to_flatten;
 *got_imap = \&got_to_flatten;
 *got_in = \&got_to_flatten;
+*got_interface_namelist = \&got_to_flatten;
 *got_iospec = \&got_to_flatten;
 *got_let = \&got_to_flatten;
 *got_lhs = \&got_to_flatten;
 *got_locks = \&got_to_flatten;
 *got_lockspec = \&got_to_flatten;
 *got_magic_assignment = \&got_to_flatten;
+*got_map_using = \&got_to_flatten;
 *got_omap = \&got_to_flatten;
 *got_out = \&got_to_flatten;
 *got_parented = \&got_to_flatten;
@@ -93,6 +95,7 @@ sub got_to_flatten {
 *got_then = \&got_to_flatten;
 *got_unsubscribe = \&got_to_flatten;
 *got_variable = \&got_to_flatten;
+*got_varpart_array = \&got_to_flatten;
 *got_wfenv = \&got_to_flatten;
 *got_wfomap = \&got_to_flatten;
 
@@ -124,7 +127,10 @@ sub got_to_hashify {
 *got_event = \&got_to_hashify;
 *got_functioncall = \&got_to_hashify;
 *got_if = \&got_to_hashify;
+*got_interface = \&got_to_hashify;
+*got_interface_call = \&got_to_hashify;
 *got_lock = \&got_to_hashify;
+*got_map = \&got_to_hashify;
 *got_repeat = \&got_to_hashify;
 *got_try = \&got_to_hashify;
 *got_unlock = \&got_to_hashify;
